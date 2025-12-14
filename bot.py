@@ -1,20 +1,28 @@
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InputTextMessageContent, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackContext, CallbackQueryHandler, ConversationHandler
+"""
+Main bot module for SSH Telegram Bot.
+Handles all Telegram bot commands and interactions.
+"""
+import os
 from time import gmtime, strftime
-from authentication import isAdminUser, add_admin_to_file
-from servers import get_servers_data, is_valid_ip, del_server, is_valid_login, add_server, client, do_command, is_connected_to_server
+from typing import Optional, List
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import ContextTypes
+import logging
 
-# Helper function to get user info from update
-def get_user_info(update: Update):
-    if update.message:
-        return update.message.chat.id, update.message.chat.username
-    elif update.callback_query:
-        return update.callback_query.message.chat.id, update.callback_query.from_user.username
-    return None, None
+from authentication import is_admin_user, add_admin_to_file
+from servers import (
+    get_servers_data, is_valid_ip, is_valid_login, add_server, del_server,
+    connect_to_server, disconnect_from_server, do_command, is_connected_to_server,
+    get_connected_server_info
+)
+from utils import get_user_info, validate_command, sanitize_input, format_server_list
+from config import Config
 
-# Start command with inline buttons
+logger = logging.getLogger(__name__)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Create inline keyboard with buttons for each command
+    """Handle /start command with inline keyboard."""
     keyboard = [
         [InlineKeyboardButton("Add Server", callback_data="add_server")],
         [InlineKeyboardButton("Delete Server", callback_data="del_server")],
@@ -26,301 +34,580 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Send message with inline keyboard
     await update.message.reply_text(
         'Welcome to **SSH Terminal Bot**\nChoose an action:',
         reply_markup=reply_markup,
         parse_mode="Markdown"
     )
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()  # Acknowledge the callback query
 
-    # Handle different callback data values
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline keyboard button presses."""
+    query = update.callback_query
+    await query.answer()
+
     if query.data == "add_server":
-        await query.message.reply_text("To add a server, use the command: /add_server [IP] [Username] [Password]")
+        await query.message.reply_text(
+            "To add a server, use the command: /add_server [IP] [Username] [Password]"
+        )
     elif query.data == "del_server":
-        await query.message.reply_text("To delete a server, use the command: /del_server [Server Number]")
+        await query.message.reply_text(
+            "To delete a server, use the command: /del_server [Server Number]"
+        )
     elif query.data == "list_servers":
         await servers_list(update, context)
     elif query.data == "connect_server":
-        await query.message.reply_text("To connect to a server, use the command: /connect [Server Number]")
+        await query.message.reply_text(
+            "To connect to a server, use the command: /connect [Server Number]"
+        )
     elif query.data == "disconnect_server":
-        await discconnect_from_server(update, context)
+        await disconnect_from_server_handler(update, context)
+    elif query.data == "default_commands":
+        await show_default_commands(update, context)
     elif query.data == "help":
         await help_command(update, context)
     elif query.data == "add_command":
-        await query.message.reply_text("To add a command, use the command: /add_command [Your Command]")
+        await query.message.reply_text(
+            "To add a command, use the command: /add_command [Your Command]"
+        )
     elif query.data == "remove_command":
-        await query.message.reply_text("To remove a command, use the command: /remove_command [Command Number]")
+        await query.message.reply_text(
+            "To remove a command, use the command: /remove_command [Command Number]"
+        )
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=update.effective_chat.id, text='Please check the repository for command guides: \n https://github.com/ItsOrv/SSH-TelegramBot')
+    """Handle /help command."""
+    help_text = (
+        "Please check the repository for command guides:\n"
+        "https://github.com/ItsOrv/SSH-TelegramBot\n\n"
+        "Available commands:\n"
+        "/start - Show main menu\n"
+        "/help - Show this help message\n"
+        "/add_admin [ID] - Add an admin (admin only)\n"
+        "/add_server [IP] [Username] [Password] - Add a server (admin only)\n"
+        "/del_server [Number] - Delete a server (admin only)\n"
+        "/servers_list - List all servers (admin only)\n"
+        "/connect [Number] - Connect to a server (admin only)\n"
+        "/disconnect - Disconnect from server (admin only)\n"
+        "/add_command [Command] - Add a default command\n"
+        "/remove_command [Number] - Remove a default command"
+    )
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=help_text)
+
 
 async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /add_admin command."""
     user_chat_id, username = get_user_info(update)
-    if isAdminUser(user_chat_id):
-        data: str = update.message.text
-        proccessed_data: str = data.replace("/add_admin", '').strip()
-        print(f">> new admin added by ({username} {user_chat_id}). \n{proccessed_data} is now admin,\n")
-        add_admin_to_file(proccessed_data)
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"New admin added \n{proccessed_data} is now admin.")
+    
+    if not is_admin_user(user_chat_id):
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="You don't have access to add a new admin."
+        )
+        return
+    
+    if not update.message:
+        return
+    
+    data = update.message.text
+    processed_data = data.replace("/add_admin", '').strip()
+    
+    if not processed_data:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Please provide an admin ID: /add_admin [ID]"
+        )
+        return
+    
+    if add_admin_to_file(processed_data):
+        logger.info(f"New admin added by ({username} {user_chat_id}): {processed_data}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"New admin added: {processed_data} is now admin."
+        )
     else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="You dont have access to add a new admin.")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Failed to add admin. Please try again."
+        )
+
 
 async def del_server_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /del_server command."""
     user_chat_id, username = get_user_info(update)
 
-    if isAdminUser(user_chat_id) or isAdminUser(username):
-        data: str = update.message.text
-        proccessed_data: int = int(str(data.replace("/del_server", '').strip()))
+    if not (is_admin_user(user_chat_id) or is_admin_user(username)):
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="You need admin access to delete a server!"
+        )
+        return
+    
+    if not update.message:
+        return
+    
+    try:
+        data = update.message.text
+        processed_data = data.replace("/del_server", '').strip()
+        
+        if not processed_data or not processed_data.isdigit():
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Please provide a valid server number: /del_server [Number]"
+            )
+            return
+        
+        server_number = int(processed_data)
         servers = get_servers_data()
-        if int(proccessed_data) <= len(servers):
-            del_server(int(proccessed_data))
-            print(int(proccessed_data), len(servers))
-            print(f'>> A server deleted by ({username} {user_chat_id})\n - Server IP : {servers[proccessed_data-1][0]}\n - Connection Info : {servers[proccessed_data-1][1]}:{servers[proccessed_data-1][2]}',
-                end="")
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f'Server Deleted\n'
-                                                f'Server IP : {servers[proccessed_data - 1][0]}\n'
-                                                f'Connection Info : {servers[proccessed_data - 1][1]}:{servers[proccessed_data - 1][2]}\n'
-                                                f'Deleted by : {user_chat_id} in {strftime("%Y-%m-%d %H:%M:%S", gmtime())}\n')
+        
+        if server_number < 1 or server_number > len(servers):
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Server doesn't exist. Please try again."
+            )
+            return
+        
+        server_info = servers[server_number - 1]
+        if del_server(server_number):
+            logger.info(
+                f"Server deleted by ({username} {user_chat_id}): "
+                f"IP={server_info[0]}, User={server_info[1]}"
+            )
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=(
+                    f'Server Deleted\n'
+                    f'Server IP: {server_info[0]}\n'
+                    f'Connection Info: {server_info[1]}:{server_info[2]}\n'
+                    f'Deleted by: {user_chat_id} at {strftime("%Y-%m-%d %H:%M:%S", gmtime())}'
+                )
+            )
         else:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f'Server doesnt exist, try again')
-    else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f'You need admin access to delete to a server!')
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Failed to delete server. Please try again."
+            )
+    except Exception as e:
+        logger.error(f"Error in del_server_handler: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="An error occurred while deleting the server."
+        )
+
 
 async def add_server_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /add_server command."""
     user_chat_id, username = get_user_info(update)
-    if isAdminUser(user_chat_id) or isAdminUser(username):
-        data: str = update.message.text
-        proccessed_data: str = data.replace("/add_server", '').strip()
-        proccessed_data_list = proccessed_data.split()
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f'Checking validity of given ip')
-        if is_valid_ip(proccessed_data_list[0]):
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f'IP validation successful.')
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f'Checking validity of login information')
-            if is_valid_login(proccessed_data_list[0] , proccessed_data_list[1] , proccessed_data_list[2]):
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=f'Login information validation successful.')
-                add_server(proccessed_data_list[0] , proccessed_data_list[1] , proccessed_data_list[2] , user_chat_id , strftime("%Y-%m-%d %H:%M:%S", gmtime()))
-                print(f">> Adding a new server by : ({username} {user_chat_id}).\n"
-                      f"    servers_list- Server Info: {proccessed_data}")
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=f'New server added! (status : Unknown)\n'
-                                                f'Server IP : {proccessed_data_list[0]}\n'
-                                                f'Connection Info : {proccessed_data_list[1]}:{proccessed_data_list[2]}\n'
-                                                f'added by : {user_chat_id} in {strftime("%Y-%m-%d %H:%M:%S", gmtime())}\n')
-            else:
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=f'Adding new server failed!\nEither username or password is not correct\nPlease try again.')
+    
+    if not (is_admin_user(user_chat_id) or is_admin_user(username)):
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="You need admin access to add a new server!"
+        )
+        return
+    
+    if not update.message:
+        return
+    
+    try:
+        data = update.message.text
+        processed_data = data.replace("/add_server", '').strip()
+        processed_data_list = processed_data.split()
+        
+        if len(processed_data_list) < 3:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Please provide IP, username, and password: /add_server [IP] [Username] [Password]"
+            )
+            return
+        
+        server_ip = processed_data_list[0]
+        server_username = processed_data_list[1]
+        server_password = processed_data_list[2]
+        
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Checking validity of given IP..."
+        )
+        
+        if not is_valid_ip(server_ip):
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Adding new server failed! Please enter a valid IP."
+            )
+            return
+        
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="IP validation successful. Checking login information..."
+        )
+        
+        if not is_valid_login(server_ip, server_username, server_password):
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Adding new server failed! Either username or password is incorrect. Please try again."
+            )
+            return
+        
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Login information validation successful. Adding server..."
+        )
+        
+        timestamp = strftime("%Y-%m-%d %H:%M:%S", gmtime())
+        if add_server(server_ip, server_username, server_password, str(user_chat_id), timestamp):
+            logger.info(
+                f"New server added by ({username} {user_chat_id}): {server_ip}"
+            )
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=(
+                    f'New server added!\n'
+                    f'Server IP: {server_ip}\n'
+                    f'Connection Info: {server_username}:{server_password}\n'
+                    f'Added by: {user_chat_id} at {timestamp}'
+                )
+            )
         else:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f'Adding new server failed!\nPlease enter a valid IP.')
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Failed to add server. Please try again."
+            )
+    except Exception as e:
+        logger.error(f"Error in add_server_handler: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="An error occurred while adding the server."
+        )
+
+
+async def servers_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /servers_list command."""
+    user_chat_id, username = get_user_info(update)
+    
+    if not (is_admin_user(user_chat_id) or is_admin_user(username)):
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="You need admin access to view list of servers!"
+        )
+        return
+    
+    logger.info(f"List of servers asked by: ({username} {user_chat_id})")
+    servers = get_servers_data()
+    table = format_server_list(servers)
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=table)
+
+
+async def connect_to_server_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /connect command."""
+    user_chat_id, username = get_user_info(update)
+    
+    if not (is_admin_user(user_chat_id) or is_admin_user(username)):
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="You need admin access to connect to a server!"
+        )
+        return
+    
+    if is_connected_to_server():
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Already connected to server. Please disconnect first using: /disconnect"
+        )
+        return
+    
+    if not update.message:
+        return
+    
+    try:
+        data = update.message.text
+        processed_data = data.replace("/connect", '').strip()
+        
+        if not processed_data or not processed_data.isdigit():
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Please provide a valid server number: /connect [Number]"
+            )
+            return
+        
+        server_index = int(processed_data) - 1
+        servers = get_servers_data()
+        
+        if server_index < 0 or server_index >= len(servers):
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Invalid server number. Please try again."
+            )
+            return
+        
+        server_info = servers[server_index]
+        server_ip = server_info[0]
+        server_username = server_info[1]
+        server_password = server_info[2]
+        
+        logger.info(
+            f"Trying to connect to server by ({username} {user_chat_id}): "
+            f"IP={server_ip}, User={server_username}"
+        )
+        
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                f'Trying to connect to server...\n'
+                f'Server IP: {server_ip}\n'
+                f'Connection Info: {server_username}:{server_password}\n'
+                f'Added by: {server_info[3]} at {server_info[4]}'
+            )
+        )
+        
+        success, error_msg = connect_to_server(server_ip, server_username, server_password)
+        
+        if success:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Successfully connected to server!"
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"Couldn't connect to server! {error_msg or 'Unknown error'}"
+            )
+    except Exception as e:
+        logger.error(f"Error in connect_to_server_handler: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="An error occurred while connecting to the server."
+        )
+
+
+async def disconnect_from_server_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /disconnect command."""
+    user_chat_id, username = get_user_info(update)
+
+    if not (is_admin_user(user_chat_id) or is_admin_user(username)):
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="You need admin access to disconnect from a server!"
+        )
+        return
+    
+    logger.info(f"Trying to close connection by ({username} {user_chat_id})")
+    
+    if disconnect_from_server():
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Connection closed!"
+        )
     else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f'You need admin access to add a new server!')
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Failed to disconnect! (Are you sure you were connected to a server?)"
+        )
 
-ADD_COMMAND = range(1)
 
-async def add_command_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.message.reply_text("Please send the command you want to add:")
-    return ADD_COMMAND
-
-async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    command = update.message.text.strip()
-    with open('commands.txt', 'a') as file:
-        file.write(f"{command}\n")
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Command {command} added successfully.", parse_mode="Markdown")
-    return ConversationHandler.END
-
-REMOVE_COMMAND = range(1)
-
-async def remove_command_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    commands = get_default_commands()
-    if not commands:
-        await update.callback_query.message.reply_text("No commands to remove.")
-        return ConversationHandler.END
-
-    message = "Please send the number of the command you want to remove:\n"
-    for idx, command in enumerate(commands, start=1):
-        message += f"{idx}- {command}\n"
-    await update.callback_query.message.reply_text(message)
-    return REMOVE_COMMAND
-
-async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    command_number = int(update.message.text.strip()) - 1
-    commands = get_default_commands()
-
-    if 0 <= command_number < len(commands):
-        removed_command = commands.pop(command_number)
-        with open('commands.txt', 'w') as file:
-            for command in commands:
-                file.write(f"{command}\n")
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Command {removed_command} removed successfully.", parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Invalid command number.")
-
-    return ConversationHandler.END
-
-def get_default_commands():
+def get_default_commands() -> List[str]:
+    """Get list of default commands from file."""
     commands = []
     try:
-        with open('commands.txt', 'r') as file:
-            commands = file.readlines()
-    except FileNotFoundError:
-        pass
-    return [command.strip() for command in commands]
+        if os.path.exists(Config.COMMANDS_FILE):
+            with open(Config.COMMANDS_FILE, 'r', encoding='utf-8') as file:
+                commands = [line.strip() for line in file.readlines() if line.strip()]
+    except Exception as e:
+        logger.error(f"Error reading commands file: {e}")
+    return commands
+
 
 async def show_default_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show default commands with inline keyboard."""
     commands = get_default_commands()
+    
     if commands:
         message = "Default Commands:\n\n"
         for idx, command in enumerate(commands, start=1):
-            message += f"{idx}- {command}\n"
+            message += f"{idx}. {command}\n"
     else:
         message = "No commands found."
 
-    # Add options to add or remove commands
     keyboard = [
         [InlineKeyboardButton("Add Command", callback_data="add_command")],
         [InlineKeyboardButton("Remove Command", callback_data="remove_command")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.callback_query.message.reply_text(message, reply_markup=reply_markup, parse_mode="Markdown")
+    if update.callback_query:
+        await update.callback_query.message.reply_text(message, reply_markup=reply_markup, parse_mode="Markdown")
+    elif update.message:
+        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode="Markdown")
 
-async def servers_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_chat_id, username = get_user_info(update)
-    if isAdminUser(user_chat_id) or isAdminUser(username):
-        print(f">> List of servers asked by : ({username} {user_chat_id}).")
-        servers = get_servers_data()
-        table = "All Servers:\n\n\n"
-        counter = 1
-        for server in servers:
-            table += (f"Server Number : {counter}\n"
-                      f"Server IP : {server[0]}\n"
-                      f"Added By : {server[3]}\n"
-                      f"Date Added : {server[4]}\n\n---------\n")
-            counter += 1
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=table)
-    else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f'You need admin access to view list of servers!')
-
-async def connect_to_server_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_chat_id, username = get_user_info(update)
-    global is_connected_to_server
-    if isAdminUser(user_chat_id) or isAdminUser(username):
-        if is_connected_to_server is False:
-            data: str = update.message.text
-            proccessed_data: str = data.replace("/connect", '').strip()
-
-            # Validate if the user entered a number
-            if not proccessed_data.isdigit():
-                await context.bot.send_message(chat_id=update.effective_chat.id, text="Please provide a valid server number.")
-                return
-
-            proccessed_data = int(proccessed_data) - 1
-            servers = get_servers_data()
-
-            if proccessed_data >= len(servers) or proccessed_data < 0:
-                await context.bot.send_message(chat_id=update.effective_chat.id, text="Invalid server number. Please try again.")
-                return
-
-            print(f'>> Trying to connect to server by ({username} {user_chat_id})\n - Server IP : {servers[proccessed_data][0]}\n - Connection Info : {servers[proccessed_data][1]}:{servers[proccessed_data][2]}\n - Result : ',
-                  end="")
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f'Trying to connect to server\n'
-                                            f'Server IP : {servers[proccessed_data][0]}\n'
-                                            f'Connection Info : {servers[proccessed_data][1]}:{servers[proccessed_data][2]}\n'
-                                            f'added by : {servers[proccessed_data][3]} in {servers[proccessed_data][4]}\n')
-            try:
-                client.connect(servers[proccessed_data][0], username=servers[proccessed_data][1],
-                               password=servers[proccessed_data][2])
-                print("Successfull!!\n")
-                is_connected_to_server = True
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=f'Successfully connected to server!')
-            except:
-                print("Failed!\n")
-                is_connected_to_server = False
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=f'Couldn\'t connect to server!')
-        else:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f'Already connected to server\nplease disconnect first using:\n/disconnect command')
-    else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f'You need admin access to connect to a server!')
-
-async def discconnect_from_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global is_connected_to_server
-    user_chat_id, username = get_user_info(update)
-
-    if isAdminUser(user_chat_id) or isAdminUser(username):
-        print(
-            f'>> Trying to close the connection by ({username} {user_chat_id})\n - Result : ',
-            end="")
-        if is_connected_to_server is True:
-            client.close()
-            is_connected_to_server = False
-            print("Successfully closed the connection\n")
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="Connection closed!")
-        else:
-            print("Failed - no connection found!\n")
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="Failed to do the task! (you sure I was connected to a server?)")
-    else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f'You need admin access to disconnect from a server!')
-
-def handle_command(text: str) -> str:
-    proccessed_text = text.lower()
-    global is_connected_to_server
-    if is_connected_to_server is True:
-        result = do_command(client, proccessed_text)
-        return f"*Done!*\n
-shell\n{proccessed_text}\n
-\n*output:*\n
-\n{result}
-"
-    else:
-        return f"Im not connected to any server.\nPlease connect me with /connect command"
-
-async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message_type: str = update.message.chat.type
-    text: str = update.message.text
-
-    print(f'>> user ({update.message.chat.first_name} {update.message.chat.last_name}) in {message_type}: "{text}"')
-
-    if message_type == 'group' or message_type == 'supergroup':
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f'Currently Im not able to execute commands given in groups!')
-        return
-    else:
-        response: str = handle_command(text)
-
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=response, parse_mode="markdown")
-
-async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f'Update {update} caused {context.error}')
-
-import csv
-
-COMMANDS_FILE = 'commands.txt'
 
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /add_command command."""
+    if not update.message:
+        return
+    
     command_text = update.message.text.replace("/add_command", "").strip()
-
-    if command_text:
-        with open(COMMANDS_FILE, "a") as file:
+    
+    if not command_text:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Please provide a command to add: /add_command [Your Command]"
+        )
+        return
+    
+    try:
+        # Validate command
+        is_valid, error_msg = validate_command(command_text, Config.BLOCKED_COMMANDS)
+        if not is_valid:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"Cannot add command: {error_msg}"
+            )
+            return
+        
+        # Sanitize command
+        command_text = sanitize_input(command_text)
+        
+        with open(Config.COMMANDS_FILE, 'a', encoding='utf-8') as file:
             file.write(f"{command_text}\n")
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Command added: {command_text}", parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Please provide a command to add using: /add_command [Your Command]")
+        
+        logger.info(f"Command added: {command_text}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Command added: `{command_text}`",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Error adding command: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Failed to add command. Please try again."
+        )
+
 
 async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        command_index = int(update.message.text.replace("/remove_command", "").strip()) - 1
-    except ValueError:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Please provide a valid command number.")
+    """Handle /remove_command command."""
+    if not update.message:
         return
-
-    commands = []
-    with open(COMMANDS_FILE, "r") as file:
-        commands = file.readlines()
-
-    if 0 <= command_index < len(commands):
+    
+    try:
+        command_text = update.message.text.replace("/remove_command", "").strip()
+        
+        if not command_text or not command_text.isdigit():
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Please provide a valid command number: /remove_command [Number]"
+            )
+            return
+        
+        command_index = int(command_text) - 1
+        commands = get_default_commands()
+        
+        if command_index < 0 or command_index >= len(commands):
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Invalid command number."
+            )
+            return
+        
         removed_command = commands.pop(command_index)
-        with open(COMMANDS_FILE, "w") as file:
-            file.writelines(commands)
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Command removed: {removed_command.strip()}", parse_mode="Markdown")
-    else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Invalid command number.")
+        
+        with open(Config.COMMANDS_FILE, 'w', encoding='utf-8') as file:
+            for command in commands:
+                file.write(f"{command}\n")
+        
+        logger.info(f"Command removed: {removed_command}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Command removed: `{removed_command}`",
+            parse_mode="Markdown"
+        )
+    except ValueError:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Please provide a valid command number."
+        )
+    except Exception as e:
+        logger.error(f"Error removing command: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Failed to remove command. Please try again."
+        )
+
+
+def handle_command(text: str) -> str:
+    """
+    Handle command execution on connected server.
+    
+    Args:
+        text: Command text to execute
+        
+    Returns:
+        Formatted response string
+    """
+    if not is_connected_to_server():
+        return "I'm not connected to any server.\nPlease connect me with /connect command"
+    
+    # Sanitize and validate command
+    sanitized_text = sanitize_input(text)
+    is_valid, error_msg = validate_command(sanitized_text, Config.BLOCKED_COMMANDS)
+    
+    if not is_valid:
+        return f"Command rejected: {error_msg}"
+    
+    try:
+        stdout, stderr = do_command(sanitized_text, timeout=Config.SSH_TIMEOUT)
+        
+        response = f"*Done!*\n```shell\n{sanitized_text}\n```\n\n*Output:*\n```\n{stdout}\n```"
+        
+        if stderr:
+            response += f"\n\n*Errors:*\n```\n{stderr}\n```"
+        
+        return response
+    except Exception as e:
+        logger.error(f"Error executing command: {e}")
+        return f"Command execution failed: {str(e)}"
+
+
+async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages as commands."""
+    if not update.message:
+        return
+    
+    message_type = update.message.chat.type
+    text = update.message.text
+    
+    if not text:
+        return
+    
+    logger.info(
+        f'User ({update.message.chat.first_name} {update.message.chat.last_name}) '
+        f'in {message_type}: "{text}"'
+    )
+    
+    if message_type in ('group', 'supergroup'):
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Currently I'm not able to execute commands given in groups!"
+        )
+        return
+    
+    response = handle_command(text)
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=response,
+        parse_mode="Markdown"
+    )
+
+
+async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors in the bot."""
+    logger.error(f"Update {update} caused error {context.error}")
+    if update and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="An error occurred. Please try again later."
+            )
+        except Exception:
+            pass
